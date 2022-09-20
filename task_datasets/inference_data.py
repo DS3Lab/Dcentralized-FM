@@ -18,7 +18,7 @@ class JsonDataset(torch.utils.data.Dataset):
             n_dummy = batch_size - len(data) % batch_size
             if n_dummy < batch_size:
                 self.idx += [-1]*n_dummy
-                self.data = self.data + [tokenizer.bos_token]*n_dummy
+                self.data = self.data + ['dummy']*n_dummy
     
     def __len__(self):
         return len(self.data)
@@ -40,6 +40,7 @@ class JsonDataset(torch.utils.data.Dataset):
 class DummyRequestProcessor:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+        print("<DummyRequestProcessor>")
         
     def set_arguments(self, args):
         self.top_k = args.top_k
@@ -49,6 +50,7 @@ class DummyRequestProcessor:
         self.top_k_per_token = args.top_k_per_token
         self.num_completions = args.num_completions
         self.max_tokens = args.generate_seq_length
+        self.stop = args.stop
         
         if (args.echo_prompt and args.input_seq_length == self.tokenizer.model_max_length+1 and args.generate_seq_length==0):
             # special case! to support 2049 tokens
@@ -60,7 +62,7 @@ class DummyRequestProcessor:
     def get_dataloader(self, batch_size, num_workers=0):
         
         dataset = JsonDataset(
-            ['you are', 'Translate to French: I am a student.']*1000, 
+            ['you are', 'hello world', '1 2 3 4', 'a b c d']*1000, 
             self.tokenizer, batch_size=batch_size,
         )
         
@@ -123,7 +125,20 @@ class DummyRequestProcessor:
                         if choice['logprobs']['top_logprobs'] is not None:
                             choice['logprobs']['top_logprobs'][0] = None    
                 item['choices'].append(choice)
-            print(json.dumps(item, indent=4))
+
+            # handle early stop
+            for c in item['choices']:
+                c['finish_reason'] = 'length'
+
+            if self.stop is not None:
+                for c in item['choices']:
+                    for stop in self.stop:
+                        if stop in c['text']:
+                            c['text'] = c['text'][:c['text'].find(stop)]
+                            c['finish_reason'] = 'stop'
+                            
+            for choice in item['choices']:
+                print([choice['text']])
         
     def write_scenario_state(self):
         pass
@@ -136,18 +151,44 @@ class RequestProcessor:
         self.request_path = request_path
         dirname = os.path.dirname(request_path)
         basename = os.path.basename(request_path)
+
         self.output_path = os.path.join(dirname, 'output_'+basename)
-        with open(self.request_path) as f:
-            self.data = []
-            for line in f:
-                if line.strip() != '':
-                    self.data.append({'request': json.loads(line)})
+        print("<RequestProcessor> dir:", dirname)
+        print("<RequestProcessor> file:", basename)
+        print("<RequestProcessor>, output file:", self.output_path)
+        if basename.endswith('jsonl'):
+            with open(self.request_path) as f:
+                self.data = []
+                for line in f:
+                    if line.strip() != '':
+                        self.data.append({'request': json.loads(line)})
+        elif basename.endswith('json'):
+            with open(self.request_path) as f:
+                self.data = [
+                    {'request': line} for line in json.load(f)
+                ]
+        else:
+            assert False, "Not supported file format"
         first_request = self.data[0]['request']
+        """
+            A line of request:
+            request_type: ClassVar[str] = "language-model-inference"
+            model: str
+            prompt: str
+            max_tokens: Optional[int] # Maximum number of tokens to generate
+            temperature: Optional[float] # Annealing temperature
+            top_p: Optional[float] # Fraction of probability mass to keep (in top-p sampling)
+            n: Optional[int] # Number of samples to generate
+            logprobs: Optional[int] # Number of tokens to show logprobs
+            echo: Optional[bool] # Include the input as part of the output (e.g., for language modeling)
+            best_of: Optional[int] # Produce This many candidates per token
+            stop: Optional[List[str]]  # Stop when any of these strings are generated
+        """
         self.top_k = first_request.get('top_k', None)
         self.top_p = first_request.get('top_p', None)
-        self.temperature = first_request.get('temperature', 1)
-        self.echo_prompt = first_request.get('echo', 1)
-        self.top_k_per_token = first_request.get('logprobs', 1)
+        self.temperature = first_request.get('temperature', 0)
+        self.echo_prompt = first_request.get('echo', 0)
+        self.top_k_per_token = first_request.get('logprobs', 0)
         self.num_completions = first_request.get('n', 1)
         self.max_tokens = first_request.get('max_tokens', 1)
         self.best_of = first_request.get('best_of', 1)
@@ -177,13 +218,14 @@ class RequestProcessor:
         
             max_input_seq_length = 1
             for i, x in enumerate(self.data):
-                seq_length = len(self.tokenizer(x['request']['prompt'])['input_ids'])
+                seq_length = self.tokenizer(x['request']['prompt'], return_tensors='pt', padding=True,
+                                            truncation=False)['input_ids'].size(1)
                 
                 if seq_length > max_input_seq_length:
                     max_input_seq_length = seq_length
-                if i > 100:
+                #if i > 100:
                     # first 100 is enough
-                    break
+                    #break
 
             if args.model_type != 't5':
                 if self.tokenizer.model_max_length > 10000:
@@ -199,24 +241,32 @@ class RequestProcessor:
                 if args.budget is not None:
                     budget = args.budget
                 else:
-                    budget = 1300*8
+                    print('warn: budget is not set, will set batch size to 1')
+                    budget = 1
 
-                args.batch_size = max(budget // (args.input_seq_length + args.generate_seq_length), 1)
-                args.token_micro_batch_size = args.batch_size
+                #args.token_micro_batch_size = 2 # TODO: hard code
+                args.batch_size = max(budget // ((args.input_seq_length + args.generate_seq_length)*self.num_completions), args.token_micro_batch_size) // args.token_micro_batch_size * args.token_micro_batch_size
+                args.batch_size = min(args.batch_size, 64) # TODO: if batch size is too large, the comm will stuck.
+                #args.token_micro_batch_size = args.batch_size
 
             else:
                 if self.tokenizer.model_max_length > 10000:
                     self.tokenizer.model_max_length = 512
                 
                 # T5 does not have length limit
-                args.input_seq_length = max_input_seq_length
+                args.input_seq_length = min(
+                    max_input_seq_length + 1,
+                    self.tokenizer.model_max_length,
+                ) # max_input_seq_length
 
                 if args.budget is not None:
                     budget = args.budget
                 else:
-                    budget = 1300*16
+                    print('warn: budget is not set, will set batch size to 1')
+                    budget = 1
 
                 args.batch_size = max(budget // (args.input_seq_length + args.generate_seq_length), 1)
+                args.batch_size = min(args.batch_size, 64)
                 args.token_micro_batch_size = args.batch_size
         
         if (args.echo_prompt and max_input_seq_length == self.tokenizer.model_max_length+1 and args.generate_seq_length==0):
@@ -307,6 +357,17 @@ class RequestProcessor:
                         c['index'] = _i
             except:
                 print('fail to sort choices')
+                
+            # handle early stop
+            for c in item['choices']:
+                c['finish_reason'] = 'length'
+
+            if self.stop is not None:
+                for c in item['choices']:
+                    for stop in self.stop:
+                        if stop in c['text']:
+                            c['text'] = c['text'][:c['text'].find(stop)]
+                            c['finish_reason'] = 'stop'
         
     def write_scenario_state(self):
         with open(self.output_path, 'w') as f:
@@ -316,6 +377,23 @@ class RequestProcessor:
             
 def get_tokenizer(args):
     
+    if args.model_type in ['yalm']:
+        from modules.yalm_tokenizer import YalmTokenizer
+        
+        tokenizer = YalmTokenizer.from_pretrained(args.model_name)
+        tokenizer.padding_side = 'left'
+        tokenizer.truncation_side = 'left'
+        return tokenizer
+    
+    if args.model_type in ['glm']:
+        from modules.glm_tokenizer import GLMTokenizer
+        
+        tokenizer = GLMTokenizer.from_pretrained(args.model_name)
+        tokenizer.padding_side = 'left'
+        tokenizer.truncation_side = 'left'
+        return tokenizer
+    
+    # default: huggingface's implementation
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -333,12 +411,16 @@ def get_tokenizer(args):
         tokenizer.pad_token = tokenizer.eos_token
     
     return tokenizer
-            
-def get_request_processor(args):
-    
+
+
+def get_request_processor(args, infer_data=None):
+    print("<get_request_processor>:", infer_data)
     tokenizer = get_tokenizer(args)
-    
-    if args.infer_data.strip() == '':
+    if infer_data is None:
+        assert args.infer_data is not None
+        infer_data = args.infer_data
+
+    if infer_data.strip() == '':
         return DummyRequestProcessor(tokenizer)
     else:
-        return RequestProcessor(args.infer_data, tokenizer)
+        return RequestProcessor(infer_data, tokenizer)

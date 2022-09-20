@@ -20,13 +20,19 @@ class YalmTokenizer:
 
     def __init__(self, vocab_file):
         self.name = "sp"
-        self._tokenizer = spm.SentencePieceProcessor(model_file=vocab_file)
+        self._tokenizer = spm.SentencePieceProcessor(
+            model_file=vocab_file,
+        )
         self._vocab_words = self._get_vocab_words()
         self.encoder = {token: idx for idx, token in enumerate(self._vocab_words)}
         self.decoder = {idx: token for idx, token in enumerate(self._vocab_words)}
         self.padding_side = 'left'
         self.truncation_side = 'left'
-        self.model_max_length = 2048
+        self.model_max_length = 2049
+        
+        self.bos_token = "<s>"
+        self.eos_token = "</s>"
+        self.pad_token = "<s>"
         
         mask_tokens = self.convert_tokens_to_ids([self.MASK_TOKEN])
         assert len(mask_tokens) == 1
@@ -42,12 +48,44 @@ class YalmTokenizer:
     def tokenize(self, line, out_type=int):
         line = convert_to_unicode(line)
         line = line.replace("\n", self.NEW_LINE)
-        return self._encode(line, out_type=out_type) # BOS will be added in another wrapper
+        has_bos = False
+        has_eos = False
+        if line.startswith('<s> '):
+            has_bos = True
+            line = line[4:]
+        elif line.startswith('<s>'):
+            has_bos = True
+            line = line[3:]
+        if line.endswith(' </s>'):
+            has_eos = True
+            line = line[:-5]
+        elif line.endswith('</s>'):
+            has_eos = True
+            line = line[:-4]
+    
+        token_ids = self._encode(line, out_type=out_type)
 
+        if has_bos:
+            if out_type == int:
+                token_ids = [1] + token_ids
+            else:
+                token_ids = [self.bos_token] + token_ids
+        if has_eos:
+            if out_type == int:
+                token_ids = token_ids + [2]
+            else:
+                token_ids = token_ids + [self.eos_token]
+
+        return token_ids
+    
     def convert_tokens_to_ids(self, tokens):
         return self._tokenizer.piece_to_id(tokens)
 
     def convert_ids_to_tokens(self, ids):
+        if isinstance(ids, int):
+            return self.decoder[ids]
+        if isinstance(ids, torch.Tensor):
+            ids = ids.cpu().tolist()
         return [self.decoder[idx] for idx in ids]
 
     def get_tokens(self):
@@ -90,25 +128,35 @@ class YalmTokenizer:
         
         assert return_tensors == 'pt'
         assert padding == 'max_length' or padding == True
-        assert truncation == True
         
         if isinstance(text, str):
             text = [text]
             
         ids = []
         for t in text:
-            t_ids = self.tokenize(t)
-            if add_bos:
-                t_ids = [1] + t_ids # append <s>
-            
-            if self.truncation_side == 'left':
-                t_ids = t_ids[-self.model_max_length:]
+            if t.startswith('<s> '):
+                t_ids = self.tokenize(t[4:])
+                t_ids = [1] + t_ids
+            elif t.startswith('<s>'):
+                t_ids = self.tokenize(t[3:])
+                t_ids = [1] + t_ids
             else:
-                t_ids = t_ids[:self.model_max_length]
+                t_ids = self.tokenize(t)
+                if add_bos:
+                    t_ids = [1] + t_ids # append <s>
+            
+            if truncation:
+                if self.truncation_side == 'left':
+                    t_ids = t_ids[-self.model_max_length:]
+                else:
+                    t_ids = t_ids[:self.model_max_length]
             
             ids.append(t_ids)
         
-        max_len = max([len(t_ids) for t_ids in ids])
+        if padding != 'max_length':
+            max_len = max([len(t_ids) for t_ids in ids])
+        else:
+            max_len = self.model_max_length
         
         attention_mask = torch.ones(len(ids), max_len, dtype=torch.long)
         
@@ -124,6 +172,10 @@ class YalmTokenizer:
                 new_ids.append(t_ids + [self.EOS]*(max_len - len(t_ids)))
         ids = new_ids
         ids = torch.tensor(ids)
+        
+        if add_bos:
+            # make sure starts with <s>
+            ids[:, 0] = 1
         
         return {
             'input_ids': ids, 'attention_mask': attention_mask

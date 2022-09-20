@@ -12,7 +12,7 @@ try:
     import wandb
 except Exception as e:
     wandb = None
-wandb = None
+#wandb = None
 
 from transformers import get_linear_schedule_with_warmup
 
@@ -174,13 +174,15 @@ class GpipeAsync:
         if self.use_fp16:
             self.model.half()
 #             tmp_optimizer = optim.AdamW(self.model.parameters(), lr=args.lr)
-            tmp_optimizer = create_optimizer(self.model, learning_rate=args.lr)
+            tmp_optimizer = create_optimizer(
+                self.model, learning_rate=args.lr, weight_decay=args.weight_decay)
             self.optimizer = get_fp16_optimizer(args, tmp_optimizer, device)
             self.scheduler = get_linear_schedule_with_warmup(
                 tmp_optimizer, args.warmup_steps, args.total_steps, )
         else:
 #             self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr)
-            self.optimizer = create_optimizer(self.model, learning_rate=args.lr)
+            self.optimizer = create_optimizer(
+                self.model, learning_rate=args.lr, weight_decay=args.weight_decay)
             self.scheduler = get_linear_schedule_with_warmup(
                 self.optimizer, args.warmup_steps, args.total_steps, )
 
@@ -365,8 +367,8 @@ class GpipeAsync:
                     loss = loss_func(input=cached_output_micro_batches[i], target=target_as_micro_batches[i])
                     tr_loss.append(loss.item())
                     if self.use_fp16:
-                        # self.optimizer.scale(loss).backward()
-                        loss.backward()
+                        self.optimizer.scale(loss).backward()
+                        # loss.backward()
                     else:
                         loss.backward()
                     self.torch_comp_stream.record_event(self.backward_comp_ready_events[i])
@@ -374,9 +376,10 @@ class GpipeAsync:
                     cupy_send_stream = cupy.cuda.ExternalStream(self.torch_send_stream.cuda_stream)
                     self.torch_send_stream.wait_event(self.backward_comp_ready_events[i])
                     self.profile_mark_backward_send_start(i)
-                    # if self.use_fp16:
-                    #     self.input_micro_batches[i].grad.copy_(
-                    #         self.optimizer.unscale(self.input_micro_batches[i].grad))
+                    if self.use_fp16:
+                        self.input_micro_batches[i].grad.copy_(
+                            self.optimizer.unscale(self.input_micro_batches[i].grad)
+                        )
                     self.comm.send(self.input_micro_batches[i].grad, dst=self.pre_node_rank, stream=cupy_send_stream)
                     self.profile_mark_backward_send_end(i)
             elif self.pp_rank == 0:  # only receive grad from previous node, do not send
@@ -384,8 +387,10 @@ class GpipeAsync:
                     cupy_recv_stream = cupy.cuda.ExternalStream(self.torch_recv_stream.cuda_stream)
                     self.profile_mark_backward_recv_start(i)
                     self.comm.recv(self.output_micro_batches_grad[i], src=self.post_node_rank, stream=cupy_recv_stream)
-                    # if self.use_fp16:
-                    #     self.output_micro_batches_grad[i] = self.optimizer.scale(self.output_micro_batches_grad[i])
+                    if self.use_fp16:
+                        self.output_micro_batches_grad[i].copy_(
+                            self.optimizer.scale(self.output_micro_batches_grad[i])
+                        )
                     self.torch_recv_stream.record_event(self.backward_recv_ready_events[i])
                 with torch.cuda.stream(self.torch_comp_stream):
                     self.torch_comp_stream.wait_event(self.backward_recv_ready_events[i])
@@ -397,8 +402,10 @@ class GpipeAsync:
                     cupy_recv_stream = cupy.cuda.ExternalStream(self.torch_recv_stream.cuda_stream)
                     self.profile_mark_backward_recv_start(i)
                     self.comm.recv(self.output_micro_batches_grad[i], src=self.post_node_rank, stream=cupy_recv_stream)
-                    # if self.use_fp16:
-                    #     self.output_micro_batches_grad[i] = self.optimizer.scale(self.output_micro_batches_grad[i])
+                    if self.use_fp16:
+                        self.output_micro_batches_grad[i].copy_(
+                            self.optimizer.scale(self.output_micro_batches_grad[i])
+                        )
                     self.torch_recv_stream.record_event(self.backward_recv_ready_events[i])
                 with torch.cuda.stream(self.torch_comp_stream):
                     self.torch_comp_stream.wait_event(self.backward_recv_ready_events[i])
@@ -409,9 +416,10 @@ class GpipeAsync:
                     cupy_send_stream = cupy.cuda.ExternalStream(self.torch_send_stream.cuda_stream)
                     self.torch_send_stream.wait_event(self.backward_comp_ready_events[i])
                     self.profile_mark_backward_send_start(i)
-                    # if self.use_fp16:
-                    #     self.input_micro_batches[i].grad.copy_(
-                    #         self.optimizer.unscale(self.input_micro_batches[i].grad))
+                    if self.use_fp16:
+                        self.input_micro_batches[i].grad.copy_(
+                            self.optimizer.unscale(self.input_micro_batches[i].grad)
+                        )
                     self.comm.send(self.input_micro_batches[i].grad, dst=self.pre_node_rank, stream=cupy_send_stream)
                     self.profile_mark_backward_send_end(i)
         if self.enable_tidy_profiling:
@@ -496,32 +504,34 @@ class GpipeAsync:
             torch.cuda.synchronize()
             self.init_time_stamp = time.time() * 1e+6
             self.init_event.record()
+        
+        step = self.global_step % self.gradient_accumulate_step
         self.zero_input_grad()
 #         self.optimizer.zero_grad(set_to_none=True)
-        self.optimizer.zero_grad(set_to_none=False)
+        if step == 0:
+            self.optimizer.zero_grad(set_to_none=False)
 
-        for step in range(self.gradient_accumulate_step):
+        outputs = self.forward_stage(input_, aux_input_data=aux_input_data)
+        forward_time = time.time()
+        forward_slot = forward_time-start_time
+        print("Rank {} node forward pass {}/{} takes {:3.2f}s"
+              .format(self.global_rank, step, self.gradient_accumulate_step, forward_slot))
             
-            outputs = self.forward_stage(input_, aux_input_data=aux_input_data)
-            forward_time = time.time()
-            if step == 0:
-                forward_slot = forward_time-start_time
-            else:
-                forward_slot = forward_time-backward_time
-            print("Rank {} node forward pass {}/{} takes {:3.2f}s"
-                  .format(self.global_rank, step, self.gradient_accumulate_step, forward_slot))
-            
-            self.comm.barrier()  # This is an educated guess that such barrier would make it fair TC (probably required)
-            self.backward_stage(outputs, target, loss_func=loss_func)
-            backward_time = time.time()
-            print("Rank {} node backward pass {}/{} takes {:3.2f}s"
+        self.comm.barrier()  # This is an educated guess that such barrier would make it fair TC (probably required)
+        self.backward_stage(outputs, target, loss_func=loss_func)
+        backward_time = time.time()
+        print("Rank {} node backward pass {}/{} takes {:3.2f}s"
                   .format(self.global_rank, step, self.gradient_accumulate_step, backward_time-forward_time))
-        optimizer_time = time.time()
-        self.optimizer_step()
-        torch.cuda.synchronize()
-        self.comm.barrier()
-        end_time = time.time()
-        print("Rank {} node optimizer step takes {:3.2f}s".format(self.global_rank, end_time - optimizer_time))
+        if step == self.gradient_accumulate_step - 1:
+            optimizer_time = time.time()
+            self.optimizer_step()
+            torch.cuda.synchronize()
+            self.comm.barrier()
+            end_time = time.time()
+            print("Rank {} node optimizer step takes {:3.2f}s".format(self.global_rank, end_time - optimizer_time))
+        else:
+            self.comm.barrier()
+            end_time = time.time()
         iter_time = end_time - start_time
         print("Rank {} node whole iteration takes {:3.2f}s".format(self.global_rank, iter_time))
         print("-------------------------------------------")

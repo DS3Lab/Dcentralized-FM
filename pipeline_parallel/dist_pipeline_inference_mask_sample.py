@@ -49,7 +49,7 @@ class DistSampleInferenceMaskAsync(DistGreedyInferenceMaskAsync):
         
         self.ret_tokens[:, save_step] = indices.squeeze(-1)
         self.ret_token_logprobs[:, save_step] = logprobs.squeeze(-1)
-        
+
     def _init_cached_seqs_and_attentions(self):
         self.merged = False
         self.cached_attention.clear()

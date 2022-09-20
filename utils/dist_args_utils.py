@@ -33,6 +33,8 @@ def add_torch_distributed_w_euler_coordinator_arguments(parser):
                         help='The IP of coordinator-server.')
     parser.add_argument('--lsf-job-no', type=str, default='100', metavar='S',
                         help='Job-<ID> assigned by LSF.')
+    parser.add_argument('--unique-port', type=str, default='100', metavar='S',
+                        help='Which port to use, each client should have different value of this.')
     parser.add_argument('--world-size', type=int, default=4, metavar='D',
                         help='world-size (default: 4)')
     parser.add_argument('--pipeline-group-size', type=int, default=4, metavar='D',
@@ -73,6 +75,7 @@ def add_training_model_arguments(parser):
                         help='-')
     parser.add_argument('--task', type=str, default='SeqClassification', metavar='S',
                         help='What task to run? SeqClassification or Seq2SeqClassification')
+
 
 def add_finetuning_model_arguments(parser):
     parser.add_argument('--model-name', type=str, default='gpt2', metavar='S',
@@ -237,8 +240,15 @@ def add_torch_distributed_inference_w_euler_coordinator_arguments(parser):
                         help='The IP of coordinator-server.')
     parser.add_argument('--lsf-job-no', type=str, default='100', metavar='S',
                         help='Job-<ID> assigned by LSF.')
+    parser.add_argument('--unique-port', type=str, default='100', metavar='S',
+                        help='Which port to use, each client should have different value of this.')
     parser.add_argument('--pipeline-group-size', type=int, default=4, metavar='D',
                         help='world-size (default: 4)')
+    parser.add_argument('--heartbeats-timelimit', type=float, default=60, metavar='S',
+                        help='time to issue heartbeats')
+    parser.add_argument('--working-directory', type=str,
+                        default='/cluster/scratch/biyuan/fetch_cache', metavar='S',
+                        help='The IP of coordinator-server.')
 
 
 def add_torch_distributed_inference_w_crusoe_coordinator_arguments(parser):
@@ -246,6 +256,28 @@ def add_torch_distributed_inference_w_crusoe_coordinator_arguments(parser):
                         help='The port of coordinator-server.')
     parser.add_argument('--coordinator-server-ip', type=str, default='localhost', metavar='S',
                         help='The IP of coordinator-server.')
+
+
+def add_lsf_coordinator_arguments(parser):
+    parser.add_argument('--coordinator-server-port', type=int, default=9002, metavar='N',
+                        help='The port of coordinator-server.')
+    parser.add_argument('--coordinator-server-ip', type=str, default='localhost', metavar='S',
+                        help='The IP of coordinator-server.')
+    parser.add_argument('--lsf-job-no', type=str, default='100', metavar='S',
+                        help='Job-<ID> assigned by LSF.')
+    parser.add_argument('--unique-port', type=str, default='100', metavar='S',
+                        help='Which port to use, each client should have different value of this.')
+    parser.add_argument('--heartbeats-timelimit', type=float, default=60, metavar='S',
+                        help='time to issue heartbeats')
+    parser.add_argument('--working-directory', type=str,
+                        default='/cluster/scratch/biyuan/fetch_cache', metavar='S',
+                        help='The IP of coordinator-server.')
+
+
+def add_global_coordinator_arguments(parser):
+    parser.add_argument('--db-server-address', type=str,
+                        default="http://xzyao:agway-fondly-ell-hammer-flattered-coconut@db.yao.sh:5984/", metavar='N',
+                        help='Key value store address.')
 
 
 def add_torch_distributed_hybrid_inference_w_euler_coordinator_arguments(parser):
@@ -257,6 +289,8 @@ def add_torch_distributed_hybrid_inference_w_euler_coordinator_arguments(parser)
                         help='The IP of coordinator-server.')
     parser.add_argument('--lsf-job-no', type=str, default='100', metavar='S',
                         help='Job-<ID> assigned by LSF.')
+    parser.add_argument('--unique-port', type=str, default='100', metavar='S',
+                        help='Which port to use, each client should have different value of this.')
     parser.add_argument('--world-size', type=int, default=4, metavar='D',
                         help='world-size (default: 4)')
     parser.add_argument('--pipeline-group-size', type=int, default=4, metavar='D',
@@ -276,7 +310,7 @@ def add_inference_details_arguments(parser):
                         help='sample from top p')
     parser.add_argument('--temperature', type=float, default=0, metavar='S',
                         help='temperature on logits')
-    parser.add_argument('--token-micro-batch-size', type=int, default=1, metavar='S',
+    parser.add_argument('--token-micro-batch-size', type=int, default=2, metavar='S',
                         help='token generation micro batch size.')
     parser.add_argument('--prompt-micro-batch-size', type=int, default=1, metavar='S',
                         help='token generation micro batch size.')
@@ -293,6 +327,8 @@ def add_inference_details_arguments(parser):
                         help='budget: for each batch, auto-assign max(n_seq * n_tokens)')
     parser.add_argument('--stop', nargs='+', type=str, default=None,
                         help='stop words')
+    parser.add_argument('--share-prefix', type=lambda x: (str(x).lower() == 'true'), default=False,
+                        help='whether to share prefix of prompt')
 
 
 def get_inference_arguments_str(args, add_rank=True, rank=None):

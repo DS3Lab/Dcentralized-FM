@@ -3,6 +3,7 @@ import json
 import torch.nn.functional
 from comm.comm_utils import *
 from modules.generation_utils import get_logits_processor, get_logits_warper
+from coordinator.http_coordinate_client import get_coordinator_client
 
 
 class DistGreedyInferenceMaskAsync:
@@ -14,8 +15,12 @@ class DistGreedyInferenceMaskAsync:
         a group of events to check if computation finishes in the forward propagation.
     """
 
-    def __init__(self, args, device, rank=None):
+    def __init__(self, args, device, rank=None, be_coordinated=False):
         print("=======Initialize Dist Inference.")
+        if be_coordinated:
+            self.coord_client = get_coordinator_client()
+        else:
+            self.coord_client = None
         if args.fp16:
             self.use_fp16 = True
             print("=======Gpipe use FP16")
@@ -53,14 +58,28 @@ class DistGreedyInferenceMaskAsync:
         self.torch_recv_stream = torch.cuda.Stream(device=device, priority=-1)
         self.torch_send_stream = torch.cuda.Stream(device=device, priority=0)
 
+        self._init_events()
+        self._init_buffers()
+
+        self._print_buffers()
+
+        self.cached_attention = []
+        self.layers = {}
+        self._create_layers()
+        self._init_cached_seqs_and_attentions()
+
+    def _init_events(self):
+        print("=========_init_events=========")
         self.forward_seq_recv_ready_events = [torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
                                               for _ in range(self.seq_num)]
         self.forward_seq_comp_ready_events = [torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
                                               for _ in range(self.seq_num)]
-        self.forward_token_recv_ready_events = [torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
-                                                for _ in range(self.generate_seq_length)]
-        self.forward_token_comp_ready_events = [torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
-                                                for _ in range(self.generate_seq_length)]
+        self.forward_token_recv_ready_events = [
+            torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+            for _ in range(self.generate_seq_length)]
+        self.forward_token_comp_ready_events = [
+            torch.cuda.Event(enable_timing=self.enable_tidy_profiling, blocking=False)
+            for _ in range(self.generate_seq_length)]
 
         if self.enable_tidy_profiling:
             self.profiling_log = []
@@ -79,7 +98,7 @@ class DistGreedyInferenceMaskAsync:
                                                         for _ in range(self.generate_seq_length)]
             else:
                 self.forward_token_comp_start_events = [torch.cuda.Event(enable_timing=True, blocking=False)
-                                                        for _ in range(self.generate_seq_length+1)]
+                                                        for _ in range(self.generate_seq_length + 1)]
             self.forward_token_send_start_events = [torch.cuda.Event(enable_timing=True, blocking=False)
                                                     for _ in range(self.generate_seq_length)]
             self.forward_token_send_end_events = [torch.cuda.Event(enable_timing=True, blocking=False)
@@ -87,6 +106,8 @@ class DistGreedyInferenceMaskAsync:
             self.init_event = torch.cuda.Event(enable_timing=True, blocking=False)
             self.init_time_stamp = None
 
+    def _init_buffers(self):
+        print("=========_init_buffers=========")
         if self.pp_rank == 0:
             self.recv_new_token = [torch.zeros((self.seq_num, 1),
                                                requires_grad=False, device=self.device, dtype=torch.int64)
@@ -96,17 +117,17 @@ class DistGreedyInferenceMaskAsync:
             self.send_new_tokens = [torch.zeros((self.seq_num, 1),
                                                 requires_grad=False, device=self.device, dtype=torch.int64)
                                     for _ in range(self.generate_seq_length)]
-            
+
         if self.pp_rank == self.pipeline_group_size - 1:
             self.initial_output_token_emb = torch.zeros(
                 (self.seq_num, 1, self.embedding_dim),
                 requires_grad=False, device=self.device, dtype=self.dtype
             )
 
-        self.input_seq_emb = [torch.zeros((args.micro_batch_size, self.input_seq_length, self.embedding_dim),
+        self.input_seq_emb = [torch.zeros((self.micro_batch_size, self.input_seq_length, self.embedding_dim),
                                           requires_grad=False, device=self.device, dtype=self.dtype)
                               for _ in range(self.seq_num)]
-        self.output_seq_emb = [torch.zeros((args.micro_batch_size, self.input_seq_length, self.embedding_dim),
+        self.output_seq_emb = [torch.zeros((self.micro_batch_size, self.input_seq_length, self.embedding_dim),
                                            requires_grad=False, device=self.device, dtype=self.dtype)
                                for _ in range(self.seq_num)]
         self.input_token_emb = [torch.zeros((self.seq_num, 1, self.embedding_dim),
@@ -115,49 +136,43 @@ class DistGreedyInferenceMaskAsync:
         self.output_token_emb = [torch.zeros((self.seq_num, 1, self.embedding_dim),
                                              requires_grad=False, device=self.device, dtype=self.dtype)
                                  for _ in range(self.generate_seq_length)]
-        
-        
+
         if self.pp_rank == self.pipeline_group_size - 1:
-            
             # donot support echo
             self.echo_prompt = False
             print('Echo prompt is not supported!')
-            
+
             ret_seq_length = self.generate_seq_length if not self.echo_prompt else self.input_seq_length + self.generate_seq_length - 1
-            
+
             self.ret_tokens = torch.zeros(
                 (self.seq_num, ret_seq_length),
                 requires_grad=False, device=self.device, dtype=torch.int64
             )
-            
+
             self.ret_token_logprobs = torch.zeros(
                 (self.seq_num, ret_seq_length),
                 requires_grad=False, device=self.device, dtype=self.dtype
             )
-            
+
             if self.top_k_per_token > 0:
                 self.ret_topk_tokens = torch.zeros(
                     (self.seq_num, ret_seq_length, self.top_k_per_token),
                     requires_grad=False, device=self.device, dtype=torch.int64
                 )
-                
+
                 self.ret_topk_token_logprobs = torch.zeros(
                     (self.seq_num, ret_seq_length, self.top_k_per_token),
                     requires_grad=False, device=self.device, dtype=self.dtype
                 )
 
-        self._print_buffers()
-
-        self.cached_attention = []
-        self.layers = {}
-        self._create_layers()
-        self._init_cached_seqs_and_attentions()
-        
+    def change_buffer_size(self):
+        self._init_events()
+        self._init_buffers()
 
     def _print_buffers(self):
         
         if self.generate_seq_length == 0:
-            # dont print when seq_length == 0
+            # don't print when seq_length == 0
             return
         
         if self.pp_rank == 0:
@@ -234,6 +249,9 @@ class DistGreedyInferenceMaskAsync:
             self.layers['block'+str(layer_index)] = GPTBlock.from_pretrained(
                 self.model_name, layer_index=global_layer_index
             ).to(self.dtype).eval().to(self.device)
+            if self.coord_client:
+                self.coord_client.update_status('running', returned_payload={
+                    'rank': self.pp_rank, 'loaded_layer': layer_index, 'total_layer': self.num_layers})
         if self.pp_rank == self.pipeline_group_size - 1:
             self.layers['lm'] = GPTLMHead.from_pretrained(
                 self.model_name
@@ -314,8 +332,7 @@ class DistGreedyInferenceMaskAsync:
             logprobs, indices = z.topk(k=self.top_k_per_token, dim=-1)
             self.ret_topk_tokens[:, save_step] = indices.squeeze(1)
             self.ret_topk_token_logprobs[:, save_step] = logprobs.squeeze(1)
-            
-            
+
     def _process_mask_during_generation(self, attention_mask):
         if attention_mask is not None:
             # increase one for the new token

@@ -8,7 +8,8 @@ from .dist_pipeline_enc_dec_inference_mask_sample import DistSampleEncDecInferen
 from .dist_pipeline_inference_greedy_token_pipe_sync import DistGreedyInferenceTokePipeSync
 from .dist_pipeline_inference_mask_greedy_token_pipe_sync import DistGreedyInferenceMaskTokenPipeSync
 from .dist_pipeline_inference_mask_sample_token_pipe_sync import DistSampleInferenceMaskTokenPipeSync
-from .dist_hybrid_inference_greedy_token import DistHybridGreedyInference
+from .dist_hybrid_inference_greedy_token_deprecated import DistHybridGreedyInference
+from .dist_hybrid_inference_greedy_token_async_deprecated import DistHybridGreedyAsyncInference
 
 
 def get_pp_module(args, vocab_size, num_classes, device, use_dp, rank=None):
@@ -24,14 +25,24 @@ def get_pp_module(args, vocab_size, num_classes, device, use_dp, rank=None):
         
         
 def get_pp_finetune_module(args, config, device, use_dp, rank=None):
+    
+    if args.model_type == 'gpt2':
+        from modules.dist_hf_gpt2_pp_train_module import GPTStageFirst, GPTStageLast, GPTStageMiddle
+    elif args.model_type == 'gptneo':
+        from modules.dist_hf_gptneo_pp_train_module import GPTStageFirst, GPTStageLast, GPTStageMiddle
+    else:
+        print(f"Not recognize this model type {args.model_type}")
+        assert False
+    
     if args.pp_mode == 'gpipe':
-        return GpipeFinetuneAsync(args, config, device, use_dp)
+        return GpipeFinetuneAsync(args, config, device, use_dp,
+                                  _StageFirst=GPTStageFirst, _StageLast=GPTStageLast, _StageMiddle=GPTStageMiddle)
     else:
         print("Not recognize this pipeline parallel mode.")
         assert False
 
 
-def get_pp_inference_module(args, device, rank=None):
+def get_pp_inference_module(args, device, rank=None, be_coordinated=False):
     if args.pp_mode == 'pipe_async_greedy':
         return DistGreedyInferenceAsync(args, device, rank=rank)
     elif args.pp_mode == 'pipe_sync_greedy':
@@ -41,15 +52,17 @@ def get_pp_inference_module(args, device, rank=None):
     elif args.pp_mode == 'pipe_sync_greedy_mask_token_pipe':
         return DistGreedyInferenceMaskTokenPipeSync(args, device, rank=rank)
     elif args.pp_mode == 'pipe_sync_sample_mask_token_pipe':
-        return DistSampleInferenceMaskTokenPipeSync(args, device, rank=rank)
+        return DistSampleInferenceMaskTokenPipeSync(args, device, rank=rank, be_coordinated=be_coordinated)
     elif args.pp_mode == 'pipe_async_greedy_mask':
         return DistGreedyInferenceMaskAsync(args, device, rank=rank)
     elif args.pp_mode == 'pipe_async_sample_mask':
         return DistSampleInferenceMaskAsync(args, device, rank=rank)
     elif args.pp_mode == 'pipe_async_sample_enc_dec_mask':
         return DistSampleEncDecInferenceMaskAsync(args, device, rank=rank)
-    elif args.pp_mode == 'pipe_hybrid_greedy':
+    elif args.pp_mode == 'pipe_hybrid_greedy_sync':
         return DistHybridGreedyInference(args, device, rank=rank)
+    elif args.pp_mode == 'pipe_hybrid_greedy_async':
+        return DistHybridGreedyAsyncInference(args, device, rank=rank)
     else:
         print("Not recognize this pipeline parallel mode.")
         assert False
